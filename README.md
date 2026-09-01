@@ -902,6 +902,30 @@ MSBuild build\combosolver.sln /p:Configuration=Release /p:Platform=x64
 patches the solver requires to observe and snapshot a duel, and freezes a
 matching card script export. It does not modify the EDOPro installation.
 
+### macOS (arm64)
+
+Xcode command line tools, premake5 (Homebrew), and an `edopro/` clone with
+its `ocgcore` and `lua/src` submodules initialised, as a sibling of this
+repository's parent (the same layout the Windows build uses).
+
+```sh
+./tools/fetch_solver_deps.sh
+premake5 gmake2
+make -C build config=release_arm64 -j
+```
+
+`fetch_solver_deps.sh` is the POSIX port of the PowerShell script: same
+pinned commits, same patches, same layout. sqlite3 comes from the system.
+
+Two properties of this build to know about. The whole workspace is compiled
+with `-ffp-contract=off`: clang contracts `a*b+c` into an FMA by default,
+which changes double bit patterns inside Lua and silently diverges replays;
+MSVC's `/fp:precise` never does, and the flag restores that guarantee.
+And there is no per-page dirty tracking yet (`GetWriteWatch` has no direct
+macOS equivalent): every restore copies the whole committed arena, which the
+report announces as `dirty pages UNAVAILABLE`. Correct, measurably slower on
+deep searches; an `mprotect`-based tracker is the planned second stage.
+
 `.\tools\build_release.ps1 -Workdir <dir> -Gabarit <replay.yrpX>` produces the
 optimised, self-contained executable and the release archive. The replay is the
 PGO training input: the profile is trained on that file and on nothing else, so
