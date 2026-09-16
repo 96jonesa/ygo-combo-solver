@@ -39,9 +39,37 @@ static inline unsigned long long r2v_tsc_ns() {
 	return static_cast<unsigned long long>(emscripten_get_now() * 1e6);
 }
 #define __rdtsc() r2v_tsc_ns()
-#else
+#elif defined(_WIN32)
 #include <intrin.h>   // _BitScanForward64
 #include <windows.h>
+#else
+// --- POSIX BACKING (macOS first) --------------------------------------------
+//
+// The Windows arm's three ingredients map almost one to one:
+//
+//   1. VirtualAlloc/VirtualFree. mmap(PROT_NONE) reserves address space
+//      without committing, mprotect(PROT_READ|PROT_WRITE) commits, munmap
+//      releases. Anonymous pages are zero-filled on first touch, which
+//      preserves MEM_COMMIT's "defined contents" guarantee the mirror
+//      depends on.
+//   2. _BitScanForward64 / __rdtsc. Direct substitutions (builtins and the
+//      same nanosecond-counter trick as the wasm arm: TscGhz() self-
+//      calibrates, so the unit is free).
+//   3. GetWriteWatch. No direct equivalent. First stage: no tracker at all
+//      (write_watch = false), and SyncDirty declares every committed page
+//      dirty — correct, just slow. Second stage (planned): mprotect the
+//      arena read-only after each sync and let a fault handler build the
+//      dirty set, which restores GetWriteWatch's economics.
+#define R2V_POSIX 1
+#include <sys/mman.h>
+#include <unistd.h>
+static inline unsigned long long r2v_tsc_ns() {
+	return static_cast<unsigned long long>(
+		std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch())
+			.count());
+}
+#define __rdtsc() r2v_tsc_ns()
 #endif
 
 // Hook declared by the lua/luaconf-customize.h patch. This is where the whole
@@ -328,6 +356,29 @@ bool Arena::Init(size_t reserve, std::uintptr_t preferred_base, std::string& err
 	// WITHOUT touching TLS, whether a bulk copy targets the arena.
 	barrier::Register(reinterpret_cast<uintptr_t>(base),
 					  reinterpret_cast<uintptr_t>(base) + reserve);
+#elif defined(R2V_POSIX)
+	page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));   // 16 KiB on Apple Silicon
+	reserve = (reserve + kSpanSize - 1) & ~(kSpanSize - 1);
+
+	// PROT_NONE mirrors MEM_RESERVE: address space only, nothing resident,
+	// commit happens page-range by page-range in CommitTo. The preferred base
+	// is a plain hint (no MAP_FIXED): inside one process the fixed address is
+	// not necessary, exactly as on the Windows arm.
+	auto reserve_at = [&](void* at) -> uint8_t* {
+		void* p = mmap(at, reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+		return p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
+	};
+	base = reserve_at(reinterpret_cast<void*>(preferred_base));
+	if(!base)
+		base = reserve_at(nullptr);
+	if(!base) {
+		error = "mmap failed for " + std::to_string(reserve) + " bytes";
+		return false;
+	}
+	// No page tracker yet: SyncDirty's no-tracker path declares everything
+	// committed dirty on every sync. DirtyTrackingAvailable() reporting false
+	// is accurate — restores are full copies until the fault handler lands.
+	write_watch = false;
 #else
 	SYSTEM_INFO si{};
 	GetSystemInfo(&si);
@@ -397,6 +448,8 @@ void Arena::Shutdown() {
 	if(base) {
 #if defined(R2V_WASM)
 		std::free(base);
+#elif defined(R2V_POSIX)
+		munmap(base, reserved);
 #else
 		VirtualFree(base, 0, MEM_RELEASE);
 #endif
@@ -418,6 +471,12 @@ bool Arena::CommitTo(size_t offset) {
 	// its full meaning. The page is zeroed so the mirror starts from defined
 	// contents (VirtualAlloc(MEM_COMMIT) did that for free).
 	std::memset(base + committed, 0, want - committed);
+#elif defined(R2V_POSIX)
+	// Committing = making the reserved pages accessible. They are anonymous
+	// and untouched, so the kernel zero-fills them on first access — the same
+	// "defined contents" guarantee VirtualAlloc(MEM_COMMIT) gives the mirror.
+	if(mprotect(base + committed, want - committed, PROT_READ | PROT_WRITE) != 0)
+		return false;
 #else
 	if(!VirtualAlloc(base + committed, want - committed, MEM_COMMIT, PAGE_READWRITE))
 		return false;
@@ -593,8 +652,25 @@ void Arena::EnsureMirror() {
 }
 
 size_t Arena::SyncDirty() {
-	if(!write_watch || !committed)
+	if(!committed)
 		return 0;
+	if(!write_watch) {
+		// NO TRACKER: everything committed is declared dirty. Correct, just
+		// slow — and STRICTLY REQUIRED: an empty dirty set here would make
+		// Restore() copy nothing back and corrupt silently. (Previously this
+		// returned 0, so the Windows fallback rung that reserves without
+		// MEM_WRITE_WATCH disabled restores instead of degrading them. It is
+		// also the first-stage POSIX arm, which has no tracker yet.)
+		const size_t pages = committed / page_size + 1;
+		if(!checkpoints.empty()) {
+			std::vector<uint64_t>& bits = checkpoints.back().dirty;
+			const size_t words = (pages + 63) / 64 + 1;
+			if(bits.size() < words)
+				bits.resize(words, 0);
+			std::fill(bits.begin(), bits.end(), ~uint64_t(0));
+		}
+		return pages;
+	}
 #if defined(R2V_WASM) && defined(R2V_NO_BARRIER)
 	// CONTROL ARM. With no barrier we know nothing: everything served is declared
 	// dirty. That is CORRECT (it is the fallback already planned for when
@@ -651,10 +727,22 @@ size_t Arena::SyncDirty() {
 			(*bits)[w] |= v;
 	}
 	return count;
+#elif defined(R2V_POSIX)
+	// write_watch is false until the fault-handler tracker lands, so the
+	// no-tracker path above already handled every call.
+	return 0;
 #else
 	size_t capacity = committed / page_size + 1;
-	if(capacity > dirty_scratch.capacity())
-		return 0;
+	if(capacity > dirty_scratch.capacity()) {
+		// The scratch buffer must never grow while the arena is live (see
+		// Init); with no room to receive the page list, degrade to the
+		// everything-dirty answer rather than an empty one.
+		if(!checkpoints.empty()) {
+			std::vector<uint64_t>& bits = checkpoints.back().dirty;
+			std::fill(bits.begin(), bits.end(), ~uint64_t(0));
+		}
+		return capacity;
+	}
 	dirty_scratch.resize(capacity);
 	ULONG_PTR count = capacity;
 	ULONG granularity = 0;
@@ -787,11 +875,11 @@ static void ForEachDirtyPage(const std::vector<uint64_t>& bits, F&& fn) {
 	for(size_t w = 0; w < bits.size(); ++w) {
 		uint64_t word = bits[w];
 		while(word) {
-#if defined(R2V_WASM)
-			const unsigned b = __builtin_ctzll(word);
-#else
+#if defined(_MSC_VER)
 			unsigned long b;
 			_BitScanForward64(&b, word);
+#else
+			const unsigned b = __builtin_ctzll(word);
 #endif
 			word &= word - 1;
 			fn((w << 6) + b);
@@ -888,6 +976,9 @@ void Arena::Restore() {
 	// restore made ITSELF have set bits: they must be dropped, exactly as
 	// ResetWriteWatch does on the Windows side.
 	barrier::ClearSlice(base_addr, committed);
+#elif defined(R2V_POSIX)
+	// First stage has no tracker to reset. (Second stage: re-protect the
+	// arena read-only here so the fault handler starts a fresh dirty set.)
 #else
 	if(write_watch && committed)
 		ResetWriteWatch(base, committed);
@@ -995,6 +1086,9 @@ void Arena::PopToAndRestore(size_t k) {
 	// restore made ITSELF have set bits: they must be dropped, exactly as
 	// ResetWriteWatch does on the Windows side.
 	barrier::ClearSlice(base_addr, committed);
+#elif defined(R2V_POSIX)
+	// First stage has no tracker to reset. (Second stage: re-protect the
+	// arena read-only here so the fault handler starts a fresh dirty set.)
 #else
 	if(write_watch && committed)
 		ResetWriteWatch(base, committed);
@@ -1344,13 +1438,13 @@ void* operator new(size_t n, std::align_val_t al) {
 		a->NoteFallback();
 		solver::detail::NoteHostFallback();
 	}
-#if defined(R2V_WASM)
+#if defined(_WIN32)
+	void* p = _aligned_malloc(n ? n : 1, static_cast<size_t>(al));
+#else
 	// aligned_alloc requires a size that is a multiple of the alignment (C11); the
 	// Windows CRT does not. We round up.
 	const size_t a = static_cast<size_t>(al);
 	void* p = std::aligned_alloc(a, ((n ? n : 1) + a - 1) & ~(a - 1));
-#else
-	void* p = _aligned_malloc(n ? n : 1, static_cast<size_t>(al));
 #endif
 	if(!p)
 		throw std::bad_alloc();
@@ -1366,10 +1460,10 @@ void operator delete(void* p, std::align_val_t) noexcept {
 			return;
 		}
 	}
-#if defined(R2V_WASM)
-	std::free(p);
-#else
+#if defined(_WIN32)
 	_aligned_free(p);
+#else
+	std::free(p);
 #endif
 }
 void operator delete[](void* p, std::align_val_t al) noexcept { operator delete(p, al); }

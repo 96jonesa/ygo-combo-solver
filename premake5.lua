@@ -5,10 +5,16 @@
 -- version contemporary with the replay being analysed, whereas the submodule of
 -- an edopro/ clone is pinned a year behind.
 --
--- Generate:
+-- Generate (Windows):
 --   premake5 vs2022 --vcpkg-root=<...\vcpkg>
--- Build:
+-- Build (Windows):
 --   MSBuild build\combosolver.sln /p:Configuration=Release /p:Platform=x64
+--
+-- Generate (macOS):
+--   premake5 gmake2
+-- Build (macOS):
+--   make -C build config=release_arm64 -j
+-- (deps come from tools/fetch_solver_deps.sh; sqlite3 is the system one)
 
 newoption {
 	trigger = "vcpkg-root",
@@ -37,8 +43,15 @@ workspace "combosolver"
 	language "C++"
 	cppdialect "C++17"
 	configurations { "Debug", "Release" }
-	platforms { "x64" }
-	architecture "x64"
+	-- arm64-only on macOS for now; the POSIX arena arm is arch-neutral
+	-- (page size from sysconf), so x86-64 macOS is a config addition later.
+	if os.target() == "macosx" then
+		platforms { "arm64" }
+		architecture "ARM64"
+	else
+		platforms { "x64" }
+		architecture "x64"
+	end
 	objdir "obj"
 	targetdir "bin/%{cfg.buildcfg}"
 	staticruntime "on"
@@ -48,6 +61,17 @@ workspace "combosolver"
 	filter "system:windows"
 		defines { "WIN32", "_WIN32", "NOMINMAX", "WIN32_LEAN_AND_MEAN",
 				  "_CRT_SECURE_NO_WARNINGS" }
+	-- Replay bit-identity depends on the FP behaviour of Lua (and of the
+	-- core feeding it): MSVC's /fp:precise never contracts a*b+c into an
+	-- FMA, but clang does BY DEFAULT, which changes double bit patterns and
+	-- silently diverges replays. Forced off for the whole workspace: the
+	-- solver's own arithmetic is not worth an FMA either if it costs
+	-- run-to-run comparability with the Windows build.
+	filter "system:macosx"
+		buildoptions { "-ffp-contract=off" }
+		-- Stock macOS ships ar but not llvm-ar, which the gmake2 clang
+		-- toolset asks for by default.
+		makesettings [[AR = ar]]
 	filter "configurations:Debug"
 		defines "_DEBUG"
 		optimize "Off"
@@ -56,11 +80,16 @@ workspace "combosolver"
 		defines "NDEBUG"
 		optimize "Speed"
 		runtime "Release"
-		-- LTO (/GL + /LTCG): the core, Lua and the solver are three separate
-		-- static libraries. Without it, inlining stops at their boundaries,
-		-- i.e. exactly at OCG_DuelProcess and at the arena allocator wired
-		-- into Lua.
-		flags { "LinkTimeOptimization" }
+		-- LTO (/GL + /LTCG, -flto on clang): the core, Lua and the solver are
+		-- three separate static libraries. Without it, inlining stops at their
+		-- boundaries, i.e. exactly at OCG_DuelProcess and at the arena
+		-- allocator wired into Lua. The flags spelling keeps older premake
+		-- binaries working; newer ones dropped it for the dedicated API.
+		if linktimeoptimization ~= nil then
+			linktimeoptimization "On"
+		else
+			flags { "LinkTimeOptimization" }
+		end
 	filter {}
 
 -- Lua, built the way ocgcore builds it: same exclusion list, same
@@ -89,6 +118,12 @@ project "solver_lua"
 	includedirs { path.join(ocgdir, "lua"), here }
 	forceincludes { "luaconf-customize.h" }
 	warnings "Off"
+	-- gmake2 compiles .c-as-C++ with CFLAGS, where cppdialect's -std does
+	-- not land, and Apple clang's `-x c++` then defaults to C++98 — which
+	-- predates the thread_local the allocator hook needs.
+	filter "system:macosx"
+		buildoptions { "-std=c++17" }
+	filter {}
 	-- Codegen levers, CORE AND LUA ONLY (82-86 % of the time per decision
 	-- lives in OCG_DuelProcess; the solver itself carries the simplex in
 	-- double, and its codegen is left alone so the benches keep returning the
@@ -98,7 +133,7 @@ project "solver_lua"
 	-- functions. /Ob3: aggressive inlining (VS2019+). Each lever is judged by
 	-- the us/call measurement of Process (tools/s24_perf_mesure.ps1) AND by
 	-- the benches.
-	filter "configurations:Release"
+	filter { "configurations:Release", "system:windows" }
 		vectorextensions "AVX2"
 		buildoptions { "/GS-", "/Ob3" }
 	filter {}
@@ -110,7 +145,7 @@ project "solver_ocgcore"
 	rtti "Off"
 	warnings "Off"
 	-- Same levers as solver_lua (see the comment above).
-	filter "configurations:Release"
+	filter { "configurations:Release", "system:windows" }
 		vectorextensions "AVX2"
 		buildoptions { "/GS-", "/Ob3" }
 	filter {}
@@ -138,12 +173,12 @@ project "combosolver"
 		path.join(ocgdir, "lua"),      -- luaconf-customize.h: the arena hook
 		path.join(ocgdir, "lua/src"),
 		lzmadir,
-		path.join(vcpkgtriplet, "include"),
 	}
-	libdirs { path.join(vcpkgtriplet, "lib") }
 	links { "solver_ocgcore", "solver_lua", "solver_lzma", "sqlite3" }
 	warnings "Extra"
 
 	filter "system:windows"
+		includedirs { path.join(vcpkgtriplet, "include") }
+		libdirs { path.join(vcpkgtriplet, "lib") }
 		links { "ws2_32", "advapi32" }
 	filter {}
