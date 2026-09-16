@@ -170,10 +170,11 @@ private:
 	size_t SyncDirty();
 	void CaptureMetadata(Checkpoint& cp) const;
 	void RestoreMetadata(const Checkpoint& cp);
-#if defined(__EMSCRIPTEN__)
-	// Hardware dirty-page tracking does not exist under wasm; it is replaced by a
-	// software write barrier, which cannot be proven by reading. These three
-	// REQUIRE it instead of assuming it (R2V_ARENA_VERIFY=1).
+#if !defined(_WIN32)
+	// Hardware dirty-page tracking does not exist under wasm (software write
+	// barrier) and is home-grown under POSIX (mprotect + fault handler);
+	// neither can be proven by reading. These three REQUIRE the dirty set
+	// instead of assuming it (R2V_ARENA_VERIFY=1).
 	void VerifyDirtySet(const Checkpoint& cp);
 public:
 	static bool VerifyBarrier();
@@ -202,6 +203,10 @@ private:
 	std::atomic<size_t> fallbacks{ 0 };
 	std::atomic<bool> poisoned{ false };
 	std::vector<uint8_t*> dirty_scratch;
+	// POSIX fault-handler tracker: one bit per page over the full reserve,
+	// sized once at Init (the handler writes into it, so it must never
+	// reallocate while the arena is live). Unused on the other arms.
+	std::vector<uint64_t> fault_dirty;
 	CheckpointCost last_push, last_restore;
 };
 

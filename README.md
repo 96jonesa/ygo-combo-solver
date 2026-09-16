@@ -921,10 +921,14 @@ Two properties of this build to know about. The whole workspace is compiled
 with `-ffp-contract=off`: clang contracts `a*b+c` into an FMA by default,
 which changes double bit patterns inside Lua and silently diverges replays;
 MSVC's `/fp:precise` never does, and the flag restores that guarantee.
-And there is no per-page dirty tracking yet (`GetWriteWatch` has no direct
-macOS equivalent): every restore copies the whole committed arena, which the
-report announces as `dirty pages UNAVAILABLE`. Correct, measurably slower on
-deep searches; an `mprotect`-based tracker is the planned second stage.
+And dirty-page tracking is home-grown (`GetWriteWatch` has no direct macOS
+equivalent): each generation starts with the arena read-only, the first
+store to a page traps, and the fault handler records it — one fault per page
+per generation, ~15x less restore traffic and ~2x decision throughput
+against the everything-dirty fallback on the reference replay.
+`R2V_ARENA_ALLDIRTY=1` forces that fallback for A/B measurement, and
+`R2V_ARENA_VERIFY=1` makes every restore prove the dirty set against the
+mirror instead of assuming it.
 
 `.\tools\build_release.ps1 -Workdir <dir> -Gabarit <replay.yrpX>` produces the
 optimised, self-contained executable and the release archive. The replay is the

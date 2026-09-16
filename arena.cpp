@@ -55,12 +55,17 @@ static inline unsigned long long r2v_tsc_ns() {
 //   2. _BitScanForward64 / __rdtsc. Direct substitutions (builtins and the
 //      same nanosecond-counter trick as the wasm arm: TscGhz() self-
 //      calibrates, so the unit is free).
-//   3. GetWriteWatch. No direct equivalent. First stage: no tracker at all
-//      (write_watch = false), and SyncDirty declares every committed page
-//      dirty — correct, just slow. Second stage (planned): mprotect the
-//      arena read-only after each sync and let a fault handler build the
-//      dirty set, which restores GetWriteWatch's economics.
+//   3. GetWriteWatch. No direct equivalent; replaced by mprotect + a fault
+//      handler (see `pagefault` below): each generation starts with the
+//      arena read-only, the first store to a page raises SIGBUS, the
+//      handler records the page and upgrades it to RW. One fault + one
+//      syscall per page per generation, against a full-arena copy per
+//      restore without it. R2V_ARENA_ALLDIRTY=1 keeps the everything-dirty
+//      behaviour (write_watch = false) for A/B measurement, the same
+//      switch the wasm arm uses.
 #define R2V_POSIX 1
+#include <atomic>
+#include <csignal>
 #include <sys/mman.h>
 #include <unistd.h>
 static inline unsigned long long r2v_tsc_ns() {
@@ -273,6 +278,101 @@ R2V_NOCOV void __memory_fill(void* d, int v, size_t n) {
 #endif   // !R2V_NO_BARRIER
 #endif   // R2V_WASM
 
+#if defined(R2V_POSIX)
+// --- FAULT-HANDLER PAGE TRACKER ---------------------------------------------
+//
+// GetWriteWatch, rebuilt from mprotect: SyncDirty leaves the arena read-only;
+// the first store to each page traps, the handler sets the page's bit and
+// makes it writable again. macOS raises SIGBUS for protection faults, Linux
+// SIGSEGV; both are installed.
+//
+// The handler must not touch TLS (same reasoning as the wasm barrier's
+// registry: a fault can, in principle, hit before a thread's TLS image is
+// usable), so arenas register their ranges in a GLOBAL fixed-size table and
+// the handler works from that alone. Everything it reads is set up before the
+// first page can trap, and everything it calls (mprotect, sigaction) is a
+// bare syscall.
+namespace pagefault {
+
+constexpr size_t kMaxArenas = 64;
+
+struct Entry {
+	std::atomic<uintptr_t> base{ 0 };
+	std::atomic<uintptr_t> end{ 0 };   // base + committed; CommitTo advances it
+	std::atomic<uint64_t*> bits{ nullptr };
+	std::atomic<size_t> page_size{ 0 };
+};
+Entry entries[kMaxArenas];
+
+struct sigaction prev_bus, prev_segv;
+
+void Handler(int sig, siginfo_t* info, void*) {
+	const uintptr_t addr = reinterpret_cast<uintptr_t>(info->si_addr);
+	for(Entry& e : entries) {
+		const uintptr_t b = e.base.load(std::memory_order_acquire);
+		if(!b || addr < b || addr >= e.end.load(std::memory_order_acquire))
+			continue;
+		const size_t psize = e.page_size.load(std::memory_order_relaxed);
+		const size_t page = (addr - b) / psize;
+		uint64_t* bits = e.bits.load(std::memory_order_relaxed);
+		bits[page >> 6] |= uint64_t(1) << (page & 63);
+		if(mprotect(reinterpret_cast<void*>(b + page * psize), psize,
+					PROT_READ | PROT_WRITE) == 0)
+			return;   // returning retries the faulting store
+		break;
+	}
+	// Not one of ours (or mprotect failed): restore the previous disposition
+	// and return; the instruction re-faults into it.
+	sigaction(sig, sig == SIGBUS ? &prev_bus : &prev_segv, nullptr);
+}
+
+void Install() {
+	static std::atomic<bool> installed{ false };
+	if(installed.exchange(true))
+		return;
+	struct sigaction sa{};
+	sa.sa_sigaction = Handler;
+	sa.sa_flags = SA_SIGINFO;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGBUS, &sa, &prev_bus);
+	sigaction(SIGSEGV, &sa, &prev_segv);
+}
+
+void Register(uintptr_t base, uintptr_t end, uint64_t* bits, size_t page_size) {
+	for(Entry& e : entries) {
+		uintptr_t expected = 0;
+		if(e.base.load(std::memory_order_relaxed) != 0)
+			continue;
+		e.bits.store(bits, std::memory_order_relaxed);
+		e.page_size.store(page_size, std::memory_order_relaxed);
+		e.end.store(end, std::memory_order_relaxed);
+		if(e.base.compare_exchange_strong(expected, base,
+										  std::memory_order_release))
+			return;
+	}
+}
+
+void UpdateEnd(uintptr_t base, uintptr_t end) {
+	for(Entry& e : entries)
+		if(e.base.load(std::memory_order_acquire) == base) {
+			e.end.store(end, std::memory_order_release);
+			return;
+		}
+}
+
+void Deregister(uintptr_t base) {
+	for(Entry& e : entries)
+		if(e.base.load(std::memory_order_acquire) == base) {
+			e.base.store(0, std::memory_order_release);
+			e.end.store(0, std::memory_order_relaxed);
+			e.bits.store(nullptr, std::memory_order_relaxed);
+			return;
+		}
+}
+
+} // namespace pagefault
+#endif
+
 namespace solver {
 namespace {
 
@@ -375,10 +475,25 @@ bool Arena::Init(size_t reserve, std::uintptr_t preferred_base, std::string& err
 		error = "mmap failed for " + std::to_string(reserve) + " bytes";
 		return false;
 	}
-	// No page tracker yet: SyncDirty's no-tracker path declares everything
-	// committed dirty on every sync. DirtyTrackingAvailable() reporting false
-	// is accurate — restores are full copies until the fault handler lands.
-	write_watch = false;
+	// R2V_ARENA_ALLDIRTY=1: no tracker, SyncDirty's no-tracker path declares
+	// everything committed dirty on every sync — the control arm the fault
+	// handler is measured against, same switch as the wasm arm.
+	static const bool all_dirty = [] {
+		const char* e = std::getenv("R2V_ARENA_ALLDIRTY");
+		return e && *e && *e != '0';
+	}();
+	if(all_dirty) {
+		write_watch = false;
+	} else {
+		// Sized for the full reserve, once: the fault handler writes into
+		// this bitmap, so it must never reallocate while the arena is live.
+		fault_dirty.assign(reserve / page_size / 64 + 2, 0);
+		pagefault::Install();
+		pagefault::Register(reinterpret_cast<std::uintptr_t>(base),
+							reinterpret_cast<std::uintptr_t>(base),
+							fault_dirty.data(), page_size);
+		write_watch = true;
+	}
 #else
 	SYSTEM_INFO si{};
 	GetSystemInfo(&si);
@@ -449,6 +564,8 @@ void Arena::Shutdown() {
 #if defined(R2V_WASM)
 		std::free(base);
 #elif defined(R2V_POSIX)
+		if(write_watch)
+			pagefault::Deregister(reinterpret_cast<std::uintptr_t>(base));
 		munmap(base, reserved);
 #else
 		VirtualFree(base, 0, MEM_RELEASE);
@@ -477,6 +594,14 @@ bool Arena::CommitTo(size_t offset) {
 	// "defined contents" guarantee VirtualAlloc(MEM_COMMIT) gives the mirror.
 	if(mprotect(base + committed, want - committed, PROT_READ | PROT_WRITE) != 0)
 		return false;
+	if(write_watch) {
+		pagefault::UpdateEnd(base_addr, base_addr + want);
+		// Fresh pages are writable and untracked until the next arming;
+		// declare them dirty now. Over-marking is safe, a missed page is
+		// silent corruption.
+		for(size_t p = committed / page_size; p < want / page_size; ++p)
+			fault_dirty[p >> 6] |= uint64_t(1) << (p & 63);
+	}
 #else
 	if(!VirtualAlloc(base + committed, want - committed, MEM_COMMIT, PAGE_READWRITE))
 		return false;
@@ -728,9 +853,28 @@ size_t Arena::SyncDirty() {
 	}
 	return count;
 #elif defined(R2V_POSIX)
-	// write_watch is false until the fault-handler tracker lands, so the
-	// no-tracker path above already handled every call.
-	return 0;
+	// Pour the fault tracker's bits into the current level, reset them, and
+	// re-arm the traps: exactly GetWriteWatch(WRITE_WATCH_FLAG_RESET).
+	const size_t words = (committed / page_size + 63) / 64 + 1;
+	std::vector<uint64_t>* bits = nullptr;
+	if(!checkpoints.empty()) {
+		bits = &checkpoints.back().dirty;
+		if(bits->size() < words)
+			bits->resize(words, 0);
+	}
+	size_t count = 0;
+	for(size_t w = 0; w < words && w < fault_dirty.size(); ++w) {
+		const uint64_t v = fault_dirty[w];
+		if(!v)
+			continue;
+		fault_dirty[w] = 0;
+		count += __builtin_popcountll(v);
+		if(bits)
+			(*bits)[w] |= v;
+	}
+	// Re-arm: the first store to each page in the new generation traps once.
+	mprotect(base, committed, PROT_READ);
+	return count;
 #else
 	size_t capacity = committed / page_size + 1;
 	if(capacity > dirty_scratch.capacity()) {
@@ -771,7 +915,7 @@ size_t Arena::SyncDirty() {
 #endif
 }
 
-#if defined(R2V_WASM)
+#if defined(R2V_WASM) || defined(R2V_POSIX)
 namespace {
 std::atomic<uint64_t> g_verify_checked{ 0 }, g_verify_missed{ 0 };
 }
@@ -945,8 +1089,9 @@ void Arena::Restore() {
 	ArenaPause off;
 	SyncDirty();
 	Checkpoint& cp = checkpoints.back();
-#if defined(R2V_WASM)
-	// BARRIER VERIFIER (R2V_ARENA_VERIFY=1).
+#if !defined(_WIN32)
+	// DIRTY-SET VERIFIER (R2V_ARENA_VERIFY=1), wasm barrier and POSIX fault
+	// tracker alike.
 	//
 	// The software barrier cannot be proven by reading: clang can lower a structure
 	// copy to `memory.copy`, which neither -fsanitize-coverage nor --wrap sees. So
@@ -957,6 +1102,13 @@ void Arena::Restore() {
 	// Cost: one memcmp of the served region per restore. Diagnostics only.
 	if(VerifyBarrier())
 		VerifyDirtySet(cp);
+#endif
+#if defined(R2V_POSIX)
+	// SyncDirty just re-armed the traps; the copies below would fault once
+	// per page. The epilogue re-arms anyway, so open the whole window in one
+	// syscall instead.
+	if(write_watch && committed)
+		mprotect(base, committed, PROT_READ | PROT_WRITE);
 #endif
 	size_t pages = 0;
 	ForEachDirtyPage(cp.dirty, [&](size_t page) {
@@ -977,8 +1129,12 @@ void Arena::Restore() {
 	// ResetWriteWatch does on the Windows side.
 	barrier::ClearSlice(base_addr, committed);
 #elif defined(R2V_POSIX)
-	// First stage has no tracker to reset. (Second stage: re-protect the
-	// arena read-only here so the fault handler starts a fresh dirty set.)
+	// Same contract as ResetWriteWatch: drop the marks the restore's own
+	// writes just made, and re-arm for the next generation.
+	if(write_watch && committed) {
+		std::fill(fault_dirty.begin(), fault_dirty.end(), 0);
+		mprotect(base, committed, PROT_READ);
+	}
 #else
 	if(write_watch && committed)
 		ResetWriteWatch(base, committed);
@@ -1065,6 +1221,11 @@ void Arena::PopToAndRestore(size_t k) {
 		cp.undo_pages.clear();
 		cp.undo_data.clear();
 	}
+#if defined(R2V_POSIX)
+	// Same as Restore: one syscall instead of one fault per copied page.
+	if(write_watch && committed)
+		mprotect(base, committed, PROT_READ | PROT_WRITE);
+#endif
 	// The arena from the mirror, each page ONCE. The bound is the in_use of the
 	// TARGET level: past that, the spans do not exist at that level.
 	// RestoreMetadata makes them pristine, and Allocate rebuilds their chains by
@@ -1087,8 +1248,12 @@ void Arena::PopToAndRestore(size_t k) {
 	// ResetWriteWatch does on the Windows side.
 	barrier::ClearSlice(base_addr, committed);
 #elif defined(R2V_POSIX)
-	// First stage has no tracker to reset. (Second stage: re-protect the
-	// arena read-only here so the fault handler starts a fresh dirty set.)
+	// Same contract as ResetWriteWatch: drop the marks the restore's own
+	// writes just made, and re-arm for the next generation.
+	if(write_watch && committed) {
+		std::fill(fault_dirty.begin(), fault_dirty.end(), 0);
+		mprotect(base, committed, PROT_READ);
+	}
 #else
 	if(write_watch && committed)
 		ResetWriteWatch(base, committed);
