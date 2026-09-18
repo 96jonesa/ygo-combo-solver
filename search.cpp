@@ -14,6 +14,8 @@
 
 namespace solver {
 
+std::atomic<bool> g_stop_requested{ false };
+
 // (SerialProgress is declared in search.h: it also serves the finisher root
 // probe. Definition further down in this file.)
 
@@ -293,6 +295,10 @@ static inline uint64_t CostKey(uint32_t burned, uint32_t actions,
 }
 
 bool Search::BudgetExhausted() const {
+	// Graceful stop: same cost profile as the poison check below — one relaxed
+	// load on a path that already reads a clock.
+	if(g_stop_requested.load(std::memory_order_relaxed))
+		return true;
 	// POISONED ARENA: an allocation escaped the arena, so Restore() no longer
 	// reconstitutes the duel. Anything that followed would describe a divergent
 	// state, so we stop here and the worker says so. One relaxed atomic load per
