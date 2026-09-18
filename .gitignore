@@ -55,3 +55,4 @@ gabarits/
 # result once and is quoted in docs/. Same rule as measurements/ above. tools/
 # keeps only the two scripts that fetch the dependencies and build the release.
 tools/*.py
+tools/ci/assets/
