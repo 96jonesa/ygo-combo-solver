@@ -1,0 +1,86 @@
+loading
+  cards             : 14755 from 1 database(s)
+  script dirs       : 8  (override)
+  ocgcore           : v11.0
+  arena             : base 0x400000000000, 256 MB reserved, dirty pages tracked
+
+reference replay
+  mode              : HAND TEST
+  garbage collector : STOPPED (memory reclaimed by restore)
+  answers to replay : 290
+
+results
+  answers consumed    : 290 / 290
+  MSG_RETRY           : 0   (faithful replay)
+  turns played        : 2
+  burned              : 19 at the board, peak 23 along the line (recovery margin 4 - calibrates --burn-slack)
+
+--- possible lines along THIS line ---
+  raw branching product          : 10^97.0
+  after dedup by code            : 10^93.1
+  (scale indicator, NOT a leaf count: changing an early
+   choice changes the prompts that follow.)
+
+--- starting position (player 0) ---
+      MAIN       91002901  Duel Evolution - Assault Zone
+      MAIN        3027001  Fake Trap
+      MAIN        3027001  Fake Trap
+      MAIN        3027001  Fake Trap
+      DECK=36  EXTRA=15
+
+--- cost of the reference line ---
+  normal summons         : 2
+  special summons        : 30
+  flip summons           : 0
+  activations            : 27
+  A_ref (tier 2)         : 59
+  D_ref (tier 3)         : 290
+
+--- target board (end of turn, player 0) ---
+    captured after answer #276
+      MZONE[0]   4891376  Zalen the Shackled Dragon            ATK
+      MZONE[1]  27572350  Bystial Dis Pater                    ATK
+      MZONE[2]   9753964  Hot Red Dragon Archfiend Abyss       ATK
+      MZONE[3]  50954680  Crystal Wing Synchro Dragon          ATK
+      MZONE[4]  63436931  Crimson Dragon                       DEF
+      MZONE[6]  29053656  Crimson Dragon Quetzacoatl           ATK
+      SZONE[2]  26387390  Junk Signal                          FACEDOWN
+      SZONE[5]  91002901  Duel Evolution - Assault Zone        FACEUP
+      HAND=2  DECK=23  EXTRA=3  GRAVE=16  REMOVED=3
+
+  C_ref (tier 1) = cards outside hand/deck/extra
+    player 0 total        : 55
+    left in hand+deck+extra: 28
+    => consommees         : 27
+       of which on the board : 8  (constant: fixed by the equivalence criterion)
+       of which burned to GY/banished: 19  <-- THIS is what the solver minimises
+
+--- cards the line engages (board + GY + banished) ---
+      1x   3027001  Fake Trap
+      1x   4891376  Zalen the Shackled Dragon
+      1x   9742784  Jet Synchron
+      1x   9753964  Hot Red Dragon Archfiend Abyss
+      1x  13021682  Starjunk Synchron
+      1x  16449363  Scrap Synchron
+      1x  18711696  Assault Sonic Warrior
+      1x  26387390  Junk Signal
+      1x  27572350  Bystial Dis Pater
+      1x  29053656  Crimson Dragon Quetzacoatl
+      2x  37799519  Stardust Synchron
+      1x  42711820  Scrap Warrior
+      1x  43834302  Synchro Fellowship
+      1x  50954680  Crystal Wing Synchro Dragon
+      1x  52687916  Trishula, Dragon of the Ice Barrier
+      1x  63436931  Crimson Dragon
+      2x  63977008  Junk Synchron
+      1x  70902743  Red Dragon Archfiend
+      1x  73218792  Junk Meister
+      1x  74586817  PSY-Framelord Omega
+      1x  77075360  Junk Speeder
+      1x  77202120  Assault Synchron
+      1x  87451661  Scarred Dragon Archfiend
+      1x  88901994  Synchro Rumble
+      1x  91002901  Duel Evolution - Assault Zone
+  self-checks  : pass, stress 57/57/0
+
+  !! scripts not found (1): c0.lua
