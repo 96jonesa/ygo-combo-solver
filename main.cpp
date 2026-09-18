@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdarg>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +46,8 @@ namespace {
 // probes, per-mechanism liveness, cost tables -- is instrumentation, and waits
 // behind --verbose. Set once in main, before any thread exists.
 bool g_verbose = false;
+// --json: also mirrored into a global, for emission sites without an Options&.
+bool g_json = false;
 
 // The self-check summary, gathered as the checks run and printed as ONE line at
 // the default level. The numbers are the ones the health gate is read on; only
@@ -138,6 +141,45 @@ struct CutCounts {
 // display "0 solutions, 0 states", exactly what a worker that ran fine and
 // found nothing displays; under address space pressure (16 workers x
 // --arena-mb) a whole run could then never have run with nothing saying so.
+// --json event emitter. One mutex-guarded line per event so workers cannot
+// interleave; the "@event " prefix is the whole contract with the reader.
+void EmitEvent(const char* fmt, ...) {
+	if(!g_json)
+		return;
+	static std::mutex event_mx;
+	char body[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	std::vsnprintf(body, sizeof body, fmt, ap);
+	va_end(ap);
+	std::lock_guard<std::mutex> lk(event_mx);
+	std::printf("@event %s\n", body);
+	std::fflush(stdout);
+}
+
+// Minimal JSON string escaping for paths and report fragments.
+std::string JsonStr(const std::string& s) {
+	std::string out;
+	out.reserve(s.size() + 8);
+	for(char c : s) {
+		switch(c) {
+		case '"': out += "\\\""; break;
+		case '\\': out += "\\\\"; break;
+		case '\n': out += "\\n"; break;
+		case '\t': out += "\\t"; break;
+		default:
+			if(static_cast<unsigned char>(c) < 0x20) {
+				char buf[8];
+				std::snprintf(buf, sizeof buf, "\\u%04x", c);
+				out += buf;
+			} else {
+				out += c;
+			}
+		}
+	}
+	return out;
+}
+
 void WorkerAbort(const char* ou, const std::string& err) {
 	static std::mutex abort_mx;
 	std::lock_guard<std::mutex> lk(abort_mx);
@@ -1049,6 +1091,10 @@ struct Options {
 	// raise it to keep more equal-cost orderings of the same line.
 	size_t max_written = 16;
 	bool verbose = false;
+	// Machine-readable event lines ("@event {json}") interleaved with the
+	// report, at the milestones a frontend tracks. The human report is
+	// unchanged; a parser that understands @event can ignore everything else.
+	bool json = false;
 	// `--help` asked for the text and got it: that is a SUCCESS. Parse failures
 	// print the same text but exit non-zero, so the two paths must be told apart
 	// here rather than at the single `return false` they used to share.
@@ -1783,6 +1829,8 @@ void Usage() {
 				"                     re-replay; candidates beyond the ceiling are the\n"
 				"                     tail of the ranking when the caller sorted.\n"
 				"  --verbose          trace every decision\n"
+				"  --json             emit machine-readable \"@event {...}\" lines at the\n"
+				"                     run's milestones, alongside the normal report\n"
 				"  --help             this text\n\nWHAT TO SEARCH FOR\n"
 				"  --solve            search for a line towards the target "
 				"board\n  --start <replay>   rebuild the reference board from "
@@ -2336,6 +2384,7 @@ bool ParseArgs(int argc, char** argv, Options& o) {
 				{ "--no-self-negate",   &Options::no_self_negate },
 				{ "--mp1-only",         &Options::mp1_only },
 				{ "--zone-serial",      &Options::zone_serial },
+				{ "--json",             &Options::json },
 			};
 			bool matched = false;
 			for(const auto& f : kBoolFlags)
@@ -3688,12 +3737,14 @@ LineResult RunLine(Duel& duel, const Replay& yrp, const Options& opt,
 void ReportLine(const LineResult& r, const Replay& yrp, const CardDB& db,
 				const Options& opt) {
 	std::printf("\nresults\n");
+	EmitEvent("{\"type\":\"phase\",\"phase\":\"replay\"}");
 	std::printf("  answers consumed    : %zu / %zu\n", r.responses_used,
 				yrp.responses.size());
 	std::printf("  MSG_RETRY           : %zu   %s\n", r.retries,
 				r.retries ? "<-- DIVERGENT REPLAY, "
 											"measurements invalid"
 						  : "(faithful replay)");
+	EmitEvent("{\"type\":\"health\",\"msgRetry\":%zu}", r.retries);
 	std::printf("  turns played        : %d\n", r.turns);
 	if(r.have_target)
 		std::printf("  burned              : %u at the board, peak %u "
@@ -4170,9 +4221,12 @@ void ReportMechanisms(const SearchConfig& cfg, const char* mode) {
 
 	std::printf("  MECANISMES [%s] : %s\n", mode,
 				on.empty() ? "none (engine defaults)" : on.c_str());
-	if(!inert.empty())
+	if(!inert.empty()) {
 		std::printf("!! REQUESTED but INERT here (dependency absent "
 							"in this mode): %s\n", inert.c_str());
+		EmitEvent("{\"type\":\"inert\",\"mode\":\"%s\",\"flags\":\"%s\"}",
+				  JsonStr(mode).c_str(), JsonStr(inert).c_str());
+	}
 }
 
 // A single test only proves one thing: Push/Pop works at depth 1. A log
@@ -5099,6 +5153,8 @@ size_t RunSolve(Duel& duel, const Replay& yrp, const Options& opt, Arena& arena,
 					o.found.size(), (unsigned long long)o.nodes,
 					(unsigned long long)o.transpos, (unsigned long long)o.cuts,
 					o.ms / 1000.0, o.timed_out ? "  (budget epuise)" : "");
+		EmitEvent("{\"type\":\"ladder\",\"discrepancies\":0,\"solutions\":%zu}",
+				  o.found.size());
 		PrintCuts(o.cut);
 		for(const auto& x : o.found)
 			sols.push_back(x);
@@ -5185,6 +5241,8 @@ size_t RunSolve(Duel& duel, const Replay& yrp, const Options& opt, Arena& arena,
 					(unsigned long long)o.transpos, (unsigned long long)o.cuts,
 					o.ms / 1000.0, o.timed_out ? "  (budget epuise)" : "", resync,
 					goals);
+		EmitEvent("{\"type\":\"ladder\",\"discrepancies\":%u,\"solutions\":%zu}",
+				  k, o.found.size());
 		PrintCuts(o.cut);
 		for(const auto& x : o.found)
 			sols.push_back(x);
@@ -5676,9 +5734,13 @@ size_t WriteSolutions(const std::vector<Solution>& sols, const Replay& start_yrp
 		a.Shutdown();
 	}).join();
 
+	EmitEvent("{\"type\":\"phase\",\"phase\":\"output\"}");
 	std::printf("\n--- output ---\n");
 	std::printf("  %zu replay(s) written to %s  (out of %zu candidate(s))\n",
 				written, outdir.c_str(), sols.size());
+	EmitEvent("{\"type\":\"written\",\"written\":%zu,\"candidates\":%zu,"
+			  "\"outdir\":\"%s\"}",
+			  written, sols.size(), JsonStr(outdir).c_str());
 	if(sols.size() > kMaxWritten)
 		std::printf("      !! %zu candidate(s) NOT EXAMINED: the "
 							"write ceiling is %zu.\n"
@@ -6934,6 +6996,8 @@ void RunFireTest(Duel& duel, Arena& arena, const Replay& yrp,
 	std::printf("\n=== --fire verdict: %zu window(s) out of %zu converted "
 					"(%zu full board, %zu without the sacrificed card) ===\n",
 				converted, windows.size(), full_n, alt_n);
+	EmitEvent("{\"type\":\"fireVerdict\",\"converted\":%zu,\"windows\":%zu}",
+			  converted, windows.size());
 	if(converted < windows.size())
 		std::printf("  unconverted windows are NOT proofs of absence: "
 							"%0.f s of sampling\n"
@@ -8487,6 +8551,7 @@ void RunTransplantSolve(Duel& duel, const Replay& ref_yrp, const Replay& start_y
 		}
 		std::printf("  seed: %llu  (--seed %llu to replay)\n",
 					(unsigned long long)base_seed, (unsigned long long)base_seed);
+		EmitEvent("{\"type\":\"seed\",\"seed\":%llu}", (unsigned long long)base_seed);
 		{
 			const int lvl = opt.nrpa_level > 0 ? opt.nrpa_level
 											  : ((budget > 180000.0) ? 3 : 2);
@@ -10463,6 +10528,7 @@ void RunTransplantSolve(Duel& duel, const Replay& ref_yrp, const Replay& start_y
 		return;
 	}
 
+	EmitEvent("{\"type\":\"phase\",\"phase\":\"search\"}");
 	std::printf("\n--- bounded-discrepancy search around the plan ---\n");
 	std::printf("  workers        : %u,  max depth %u decisions,  novelty "
 					"%s (patience %u, strict)\n", threads,
@@ -10583,6 +10649,8 @@ void RunTransplantSolve(Duel& duel, const Replay& ref_yrp, const Replay& start_y
 					ms / 1000.0, best_overlap,
 					target.codes.size(), best_monsters,
 					timed_out ? "  (budget epuise)" : "");
+		EmitEvent("{\"type\":\"ladder\",\"discrepancies\":%u,\"solutions\":%zu}",
+				  k, found.size());
 		PrintCuts(cut);
 		if(claims.Overflow())
 			std::printf("           !! partition saturated %llu "
@@ -10909,6 +10977,7 @@ int main(int argc, char** argv) {
 		return opt.help ? 0 : 2;
 	}
 	g_verbose = opt.verbose;
+	g_json = opt.json;
 	// Before any thread is created: publication of the flag rides on the workers'
 	// launch.
 	if(opt.profile)
@@ -10981,6 +11050,7 @@ int main(int argc, char** argv) {
 	}
 
 	std::printf("loading\n");
+	EmitEvent("{\"type\":\"phase\",\"phase\":\"loading\"}");
 	auto t_db = Clock::now();
 	CardDB db;
 	if(!db.Load(opt.workdir, error)) {
@@ -11984,6 +12054,8 @@ int main(int argc, char** argv) {
 					if(!s->empty())
 						sc += ", " + *s;
 				std::printf("  self-checks  : %s\n", sc.c_str());
+				EmitEvent("{\"type\":\"selfChecks\",\"pass\":%s,\"detail\":\"%s\"}",
+						  ok ? "true" : "false", JsonStr(sc).c_str());
 			}
 			if(ok && opt.growth)
 				RunGrowthMeasurement(duel, *yrp, opt, *arena_ptr, first);
