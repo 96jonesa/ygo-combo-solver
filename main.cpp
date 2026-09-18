@@ -1029,6 +1029,10 @@ struct Options {
 	std::vector<std::string> scriptdirs;
 	// Directory of the replays produced: the requested deliverable.
 	std::string outdir = "solutions";
+	// Write ceiling: candidates examined (each one is a full re-replay) and
+	// written, best-first after the caller's sort. 16 covers the useful set;
+	// raise it to keep more equal-cost orderings of the same line.
+	size_t max_written = 16;
 	bool verbose = false;
 	// `--help` asked for the text and got it: that is a SUCCESS. Parse failures
 	// print the same text but exit non-zero, so the two paths must be told apart
@@ -1759,6 +1763,10 @@ void Usage() {
 				"  --player <0|1>     player whose turn is optimised (default "
 				"0)\n  --outdir <dir>     where the replays produced are "
 				"written (default\n                     solutions/)\n"
+				"  --max-written <n>  ceiling of solutions examined and written per run\n"
+				"                     (default 16). Each written solution costs a full\n"
+				"                     re-replay; candidates beyond the ceiling are the\n"
+				"                     tail of the ranking when the caller sorted.\n"
 				"  --verbose          trace every decision\n"
 				"  --help             this text\n\nWHAT TO SEARCH FOR\n"
 				"  --solve            search for a line towards the target "
@@ -2531,6 +2539,9 @@ bool ParseArgs(int argc, char** argv, Options& o) {
 		} else if(a == "--max-ecarts") {
 			const char* v = next("--max-ecarts"); if(!v) return false;
 			o.max_ecarts = static_cast<uint32_t>(std::atoi(v));
+		} else if(a == "--max-written") {
+			const char* v = next("--max-written"); if(!v) return false;
+			o.max_written = static_cast<size_t>(std::atoi(v));
 		} else if(a == "--reroot") {
 			o.levin_reroot = true;
 		} else if(a == "--reroot-h") {
@@ -5402,8 +5413,9 @@ size_t WriteSolutions(const std::vector<Solution>& sols, const Replay& start_yrp
 					  const std::vector<BoardKey>* target_alts) {
 	std::error_code ec;
 	std::filesystem::create_directories(outdir, ec);
-	// Write ceiling, named instead of being a bare 16 at the bottom of a loop.
-	constexpr size_t kMaxWritten = 16;
+	// Write ceiling (--max-written): named instead of being a bare number at
+	// the bottom of a loop.
+	const size_t kMaxWritten = opt.max_written ? opt.max_written : 1;
 	size_t written = 0, rejected = 0;
 	size_t rej_retry = 0, rej_cons = 0, rej_board = 0;
 	// WITNESSES OF THE REJECTED CANDIDATES: a line that touched the goal during
