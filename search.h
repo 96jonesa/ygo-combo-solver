@@ -30,6 +30,12 @@
 
 namespace solver {
 
+// GRACEFUL STOP. Set (only) by a signal handler; read at every budget check.
+// When true, every search phase treats its time budget as expired, unwinds
+// through its normal exit, and the run writes whatever it has found. The
+// process then terminates by finishing, not by being killed.
+extern std::atomic<bool> g_stop_requested;
+
 // Target board in the sense of the equivalence criterion we use: same cards per
 // zone TYPE, same materials, same counters, same FACE (up/down). The exact
 // column is ignored, and so is the ATK/DEF battle position (two boards that

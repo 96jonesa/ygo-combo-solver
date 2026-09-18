@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <csignal>
 #include <cstring>
 #include <atomic>
 #include <filesystem>
@@ -59,6 +60,20 @@ using Clock = std::chrono::steady_clock;
 
 double MsSince(Clock::time_point t0) {
 	return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+}
+
+// Graceful stop (see search.h): phase loops in this file poll it alongside
+// their `spent < budget` conditions, so a stop can't leave them spinning
+// through rungs whose searches all return instantly.
+bool StopRequested() {
+	return solver::g_stop_requested.load(std::memory_order_relaxed);
+}
+
+extern "C" void HandleStopSignal(int) {
+	// Signal-handler-safe: one lock-free store, nothing else. The run reports
+	// nothing here; the budget rows it prints on the way out say "budget
+	// epuise", which is exactly what a stop means.
+	solver::g_stop_requested.store(true, std::memory_order_relaxed);
 }
 
 // The six mechanisms that REMOVE branches, per line and per pass. All of them
@@ -1071,6 +1086,10 @@ struct Options {
 	std::vector<std::string> scriptdirs;
 	// Directory of the replays produced: the requested deliverable.
 	std::string outdir = "solutions";
+	// Write ceiling: candidates examined (each one is a full re-replay) and
+	// written, best-first after the caller's sort. 16 covers the useful set;
+	// raise it to keep more equal-cost orderings of the same line.
+	size_t max_written = 16;
 	bool verbose = false;
 	// Machine-readable event lines ("@event {json}") interleaved with the
 	// report, at the milestones a frontend tracks. The human report is
@@ -1805,6 +1824,10 @@ void Usage() {
 				"  --player <0|1>     player whose turn is optimised (default "
 				"0)\n  --outdir <dir>     where the replays produced are "
 				"written (default\n                     solutions/)\n"
+				"  --max-written <n>  ceiling of solutions examined and written per run\n"
+				"                     (default 16). Each written solution costs a full\n"
+				"                     re-replay; candidates beyond the ceiling are the\n"
+				"                     tail of the ranking when the caller sorted.\n"
 				"  --verbose          trace every decision\n"
 				"  --json             emit machine-readable \"@event {...}\" lines at the\n"
 				"                     run's milestones, alongside the normal report\n"
@@ -2580,6 +2603,9 @@ bool ParseArgs(int argc, char** argv, Options& o) {
 		} else if(a == "--max-ecarts") {
 			const char* v = next("--max-ecarts"); if(!v) return false;
 			o.max_ecarts = static_cast<uint32_t>(std::atoi(v));
+		} else if(a == "--max-written") {
+			const char* v = next("--max-written"); if(!v) return false;
+			o.max_written = static_cast<size_t>(std::atoi(v));
 		} else if(a == "--reroot") {
 			o.levin_reroot = true;
 		} else if(a == "--reroot-h") {
@@ -5147,7 +5173,7 @@ size_t RunSolve(Duel& duel, const Replay& yrp, const Options& opt, Arena& arena,
 	}
 
 	uint32_t k_start = 1;
-	if(opt.novelty_ab && patience && spent < opt.solve_ms) {
+	if(opt.novelty_ab && patience && spent < opt.solve_ms && !StopRequested()) {
 		// CONTROL (--novelty-ab), off by default: it costs two extra passes,
 		// up to 2 x 20 s taken from --solve-ms, and moves the ladder to k = 2.
 		// A pruning that gains 10x in states but loses solutions must SAY SO
@@ -5195,7 +5221,8 @@ size_t RunSolve(Duel& duel, const Replay& yrp, const Options& opt, Arena& arena,
 
 	std::printf("\n  %-8s %10s %12s %11s %10s %9s\n", "discrep.", "solutions",
 				"states", "transpos.", "cuts", "time");
-	for(uint32_t k = k_start; k <= opt.max_ecarts && spent < opt.solve_ms; ++k) {
+	for(uint32_t k = k_start;
+		k <= opt.max_ecarts && spent < opt.solve_ms && !StopRequested(); ++k) {
 		reached = k;
 		PassOut o = run_pass(k, patience, opt.solve_ms - spent);
 		spent += o.ms;
@@ -5460,8 +5487,9 @@ size_t WriteSolutions(const std::vector<Solution>& sols, const Replay& start_yrp
 					  const std::vector<BoardKey>* target_alts) {
 	std::error_code ec;
 	std::filesystem::create_directories(outdir, ec);
-	// Write ceiling, named instead of being a bare 16 at the bottom of a loop.
-	constexpr size_t kMaxWritten = 16;
+	// Write ceiling (--max-written): named instead of being a bare number at
+	// the bottom of a loop.
+	const size_t kMaxWritten = opt.max_written ? opt.max_written : 1;
 	size_t written = 0, rejected = 0;
 	size_t rej_retry = 0, rej_cons = 0, rej_board = 0;
 	// WITNESSES OF THE REJECTED CANDIDATES: a line that touched the goal during
@@ -9698,7 +9726,7 @@ void RunTransplantSolve(Duel& duel, const Replay& ref_yrp, const Replay& start_y
 								if(i >= backs.size())
 									break;
 								double left = a1_deadline - MsSince(t0);
-								if(left < 2000 || found.load() >= found_stop)
+								if(left < 2000 || StopRequested() || found.load() >= found_stop)
 									break;
 								const uint32_t back = backs[i];
 								if(ap->responses.size() <= back)
@@ -9914,7 +9942,7 @@ void RunTransplantSolve(Duel& duel, const Replay& ref_yrp, const Replay& start_y
 									  cheap[i]->responses.end() - back) });
 						}
 			}
-			if(!roots2.empty() && found.load() < found_stop &&
+			if(!roots2.empty() && found.load() < found_stop && !StopRequested() &&
 			   a2_deadline - MsSince(t0) > 2000) {
 				std::vector<std::unique_ptr<NrpaShared>> shared2;
 				for(size_t i = 0; i < roots2.size(); ++i)
@@ -10014,7 +10042,7 @@ void RunTransplantSolve(Duel& duel, const Replay& ref_yrp, const Replay& start_y
 									if(pk >= grp->idx.size() * 3)
 										break;
 									double left = a2_deadline - MsSince(t0);
-									if(left < 2000 ||
+									if(left < 2000 || StopRequested() ||
 									   found.load() >= found_stop)
 										break;
 									const size_t r =
@@ -10238,7 +10266,7 @@ void RunTransplantSolve(Duel& duel, const Replay& ref_yrp, const Replay& start_y
 							// A few solutions are enough: the remaining roots
 							// would only bring variants. (In optimisation:
 							// never enough, hence found_stop.)
-							if(left < 2000 || found.load() >= found_stop)
+							if(left < 2000 || StopRequested() || found.load() >= found_stop)
 								break;
 							fa.Restore();
 							PrefixCount pc = replay_prefix(fd, roots[i].pre);
@@ -10380,7 +10408,7 @@ void RunTransplantSolve(Duel& duel, const Replay& ref_yrp, const Replay& start_y
 	// prefixes of the cheapest solutions are its roots, and a backtrack that
 	// saves one burned card is a win.
 	if((sols.empty() || opt.optimize) &&
-	   (spent < opt.solve_ms || opt.finisher_min > 0) &&
+	   (spent < opt.solve_ms || opt.finisher_min > 0) && !StopRequested() &&
 	   (!best_path.empty() || !global_archive.empty() ||
 		!opt.approach_files.empty() || !sols.empty())) {
 		double budget = opt.finisher_min > 0
@@ -10509,7 +10537,8 @@ void RunTransplantSolve(Duel& duel, const Replay& ref_yrp, const Replay& start_y
 				"states", "transpos.", "cuts", "time");
 
 	uint32_t reached = 0;
-	for(uint32_t k = 0; k <= opt.max_ecarts && spent < opt.solve_ms && sols.empty(); ++k) {
+	for(uint32_t k = 0; k <= opt.max_ecarts && spent < opt.solve_ms &&
+				sols.empty() && !StopRequested(); ++k) {
 		reached = k;
 		double budget = opt.solve_ms - spent;
 		auto t0 = Clock::now();
@@ -10933,6 +10962,14 @@ int main(int argc, char** argv) {
 #else
 	// Without this, a crash takes the tail of the buffer and hides the exact place.
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
+#endif
+	// Graceful stop: SIGTERM/SIGINT (SIGBREAK too on Windows) finish the run
+	// instead of killing it — every phase treats its budget as expired and
+	// the solutions found so far are written on the way out.
+	std::signal(SIGTERM, HandleStopSignal);
+	std::signal(SIGINT, HandleStopSignal);
+#if defined(_WIN32)
+	std::signal(SIGBREAK, HandleStopSignal);
 #endif
 	Options opt;
 	if(!ParseArgs(argc, argv, opt)) {
